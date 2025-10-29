@@ -2052,30 +2052,32 @@ class manualTaskScreen:
         self.create_live_tasks_table()
         QTimer.singleShot(0, self.populate_live_tasks)
 
+    from PyQt6.QtCore import QTimer
+
     def show_tasks_live_popup(self):
-        # Dim the screen (identical helper used by NewTaskPopup flow)
-        if hasattr(self, "elements"):
-            set_screen_opacity(self.elements, 0.3)
-
-        popup = LiveSuccessPopup(self.window, message="Your Tasks are now Live!")
-
-        def finished_handler(code):
-            # Restore full opacity (identical to createNewTask)
+        def do_show():
             if hasattr(self, "elements"):
-                set_screen_opacity(self.elements, 1.0)
+                set_screen_opacity(self.elements, 0.3)
 
-            # Refocus parent (same as createNewTask)
-            if self.window:
-                try:
-                    self.window.activateWindow()
-                    self.window.raise_()
-                except Exception:
-                    pass
+            popup = LiveSuccessPopup(self.window, message="Your Tasks are now Live!")
 
-            popup.deleteLater()
+            def finished_handler(code):
+                if hasattr(self, "elements"):
+                    set_screen_opacity(self.elements, 1.0)
+                if self.window:
+                    try:
+                        self.window.activateWindow()
+                        self.window.raise_()
+                    except Exception:
+                        pass
+                popup.deleteLater()
 
-        popup.finished.connect(finished_handler)
-        popup.open()  # non-blocking, identical to createNewTask
+            popup.finished.connect(finished_handler)
+            popup.open()
+
+        # This queues it safely on the GUI thread even if you call it from a worker
+        QTimer.singleShot(0, do_show)
+
 
 
 
