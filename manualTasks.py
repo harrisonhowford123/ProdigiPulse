@@ -14,7 +14,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtPrintSupport import QPrinter
 
-from clientCalls import fetch_manual_tasks, edit_tasks, fetch_all_employees, fetch_employees_tasks
+from clientCalls import fetch_manual_tasks, edit_tasks, fetch_all_employees, fetch_employees_tasks, get_facility_workstations
 
 # Optional barcode support
 try:
@@ -470,6 +470,23 @@ class PDFPreview(QWidget):
         self.setMinimumSize(width, height)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # Enable keyboard focus
 
+        tasks = fetch_employees_tasks()
+        if tasks and tasks[-1]:
+            availableNum = tasks[-1][-1]
+            # ✅ Increment by 1 if it looks like an "m##########" string
+            if isinstance(availableNum, str) and availableNum.startswith("m") and availableNum[1:].isdigit():
+                num = int(availableNum[1:]) + 1
+                availableNum = f"m{num:010d}"
+            elif isinstance(availableNum, int):
+                availableNum += 1
+        else:
+            availableNum = None
+        tasks = []
+
+        self.startCode = availableNum
+        print(f"[DEBUG] startCode initialized to {self.startCode}")
+
+
         self.setStyleSheet("background-color: transparent;")
         self.logo = None
         self.labels = []  # store text labels for boxes
@@ -480,6 +497,68 @@ class PDFPreview(QWidget):
         logo_path = resource_path("images/logo.png")
         if os.path.exists(logo_path):
             self.logo = QPixmap(logo_path)
+
+    def assign_employees_to_labels(self, employees, task_table):
+        from collections import defaultdict
+
+        if not hasattr(self, "labels") or not self.labels:
+            print("⚠️ No labels to assign.")
+            return
+
+        if not employees:
+            print("⚠️ No employees assigned; clearing preview names.")
+            self.label_assignments = {}
+            return
+
+        # --- 1. Group barcodes by task label
+        start_num = 0
+        if hasattr(self.pdf_preview, "startCode") and str(self.pdf_preview.startCode).startswith("m"):
+            start_num = int(self.pdf_preview.startCode[1:])
+
+        for idx, label in enumerate(labels):
+            bc_num = start_num + idx
+            bc = f"m{bc_num:010d}"
+            task_barcodes[label].append(bc)
+
+
+        # --- 2. Gather all task rows from the table
+        tasks = []
+        for row in range(1, task_table.rowCount()):
+            name_item = task_table.item(row, 0)
+            qty_item = task_table.item(row, 1)
+            bc_item = task_table.item(row, 2)
+            if not name_item:
+                continue
+            try:
+                task_name = name_item.text().strip()
+                qty = int(qty_item.text()) if qty_item else 0
+                count = int(bc_item.text()) if bc_item else 0
+            except Exception:
+                continue
+            if count <= 0:
+                continue
+            label = f"{task_name} x {qty}"
+            tasks.append((label, count))
+
+        # --- 3. Divide each task's barcodes across employees
+        self.label_assignments = {}
+        n = len(employees)
+        for label, _ in tasks:
+            barcode_indices = task_barcodes.get(label, [])
+            if not barcode_indices:
+                continue
+
+            per_emp = len(barcode_indices) // n
+            remainder = len(barcode_indices) % n
+            start = 0
+            for i, emp in enumerate(employees):
+                end = start + per_emp + (1 if i < remainder else 0)
+                for idx in barcode_indices[start:end]:
+                    self.label_assignments[idx] = emp
+                start = end
+
+        print("📋 PDF preview updated with employee name assignments.")
+
 
     def calculate_boxes(self):
         """Calculate coordinates for 6 rows (12 boxes total: left & right)."""
@@ -595,7 +674,11 @@ class PDFPreview(QWidget):
                 
                 # Generate unique barcode number for this box across all pages
                 global_box_idx = self.current_page * 12 + box_idx
-                barcode_number = f"m{str(global_box_idx).zfill(10)}"
+                if self.startCode and str(self.startCode).startswith("m"):
+                    start_num = int(self.startCode[1:])  # strip 'm' and get numeric
+                    barcode_number = f"m{str(start_num + global_box_idx).zfill(10)}"
+                else:
+                    barcode_number = f"m{str(global_box_idx).zfill(10)}"
 
                 # Only draw label if we have one for this box on this page
                 if box_idx < len(current_labels):
@@ -610,6 +693,21 @@ class PDFPreview(QWidget):
                     )
                     painter.drawText(text_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, text)
 
+                    # >>> NEW BLOCK: draw employee name if assigned <<<
+                    if hasattr(self, "label_assignments"):
+                        emp_name = self.label_assignments.get(global_box_idx)
+                        if emp_name:
+                            painter.setFont(QFont("Arial", 7, QFont.Weight.Normal))
+                            emp_rect = QRect(
+                                int(x + 5),
+                                int(y + 22),  # just below the task label
+                                int(w - 10),
+                                15
+                            )
+                            painter.drawText(emp_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, emp_name)
+                            painter.setFont(QFont("Arial", 8, QFont.Weight.Medium))  # restore font
+                    # <<< END NEW BLOCK >>>
+
                     # Draw barcode number at BOTTOM center
                     barcode_text_rect = QRect(
                         int(x + 5),
@@ -622,10 +720,11 @@ class PDFPreview(QWidget):
                     painter.setFont(QFont("Arial", 8, QFont.Weight.Medium))  # restore font
 
                     # Draw barcode image in CENTER of box
-                    self._draw_barcode(painter, barcode_number, x, y, w, h)
+                    self._draw_barcode(painter, barcode_number, x, y+5, w, h)
 
         except Exception as e:
             print(f"[ERROR] PDFPreview paintEvent exception: {e}")
+
 
     def render_page_to_painter(self, painter, page_num, page_width, page_height):
         """Render a specific page to a painter (for PDF export)."""
@@ -692,7 +791,11 @@ class PDFPreview(QWidget):
                 x, y, w, h = boxes[box_idx]
                 
                 global_box_idx = page_num * 12 + box_idx
-                barcode_number = f"m{str(global_box_idx).zfill(10)}"
+                if self.startCode and str(self.startCode).startswith("m"):
+                    start_num = int(self.startCode[1:])  # strip 'm' and get numeric
+                    barcode_number = f"m{str(start_num + global_box_idx).zfill(10)}"
+                else:
+                    barcode_number = f"m{str(global_box_idx).zfill(10)}"
 
                 if box_idx < len(page_labels):
                     text = page_labels[box_idx]
@@ -812,11 +915,57 @@ class PDFPreview(QWidget):
         painter.setBrush(QBrush(Qt.GlobalColor.black))
         painter.drawRect(int(barcode_x + (bar_count - 1) * bar_width), barcode_y, int(bar_width), barcode_height)
 
-def sendFormat(data, pdf_preview):
-    """
-    Given table data, generate box labels and draw them on the PDF.
-    """
+class LiveSuccessPopup(QDialog):
+    """Identical styling/flow to NewTaskPopup; text in top half, square tick centered below."""
+    def __init__(self, parent=None, message="Your Tasks are now Live!", margin=16, btn_size=40):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setModal(True)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
+        self.setStyleSheet("background-color: #3B3B3B;")  # same as NewTaskPopup
+
+        # ---- Title ----
+        self.title_label = QLabel(message, self)
+        self.title_label.setStyleSheet("color:white;")
+        self.title_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_h = 25
+
+        # ---- Dimensions ----
+        msg_block_h = 50
+        total_height = margin + self.title_h + 5 + msg_block_h + margin
+        total_width  = margin + 220 + btn_size * 2 + margin
+        self.setFixedSize(total_width, total_height)
+
+        # ---- Place title in top half ----
+        title_y = total_height // 4 - self.title_h // 2
+        self.title_label.setGeometry(
+            margin,
+            title_y,
+            total_width - 2 * margin,
+            self.title_h
+        )
+
+        # ---- Square tick button centered below title ----
+        tick_x = (total_width - btn_size) // 2
+        tick_y = total_height // 2  # vertically centered below text
+        self.tick_btn = TickCrossButton(is_tick=True, parent=self, callback=self.accept)
+        self.tick_btn.setGeometry(tick_x, tick_y, btn_size, btn_size)  # square dimensions
+
+        # ---- No cross button ----
+
+        # ---- Center on parent ----
+        if parent:
+            pg = parent.geometry()
+            self.move(
+                pg.x() + (pg.width() - self.width()) // 2,
+                pg.y() + (pg.height() - self.height()) // 2
+            )
+
+def sendFormat(data, pdf_preview, employee_multiplier=1):
     labels = []
+    employee_multiplier = max(1, int(employee_multiplier or 1))
+
     for row in data:
         if len(row) < 3:
             continue
@@ -827,15 +976,13 @@ def sendFormat(data, pdf_preview):
         except ValueError:
             continue  # skip invalid rows
         
-        # Skip rows with 0 barcodes
         if count <= 0:
             continue
 
         label = f"{name} x {qty}"
-        # Add this label 'count' times (once for each barcode)
-        for _ in range(count):
+        # Add this label 'count * employee_multiplier' times
+        for _ in range(count * employee_multiplier):
             labels.append(label)
-            # REMOVED THE 12 LIMIT HERE - let it add all labels
 
     # Update PDF
     pdf_preview.update_labels(labels)
@@ -1039,87 +1186,15 @@ def createNewTask(parent=None, button=None, task_table=None, screen_elements=Non
     popup.open()  # Non-blocking - this enables the fade-in animation!
 
 
-def exportToAlly(parent=None, button=None, task_table=None, pdf_preview=None, screen_elements=None):
-    # Dim the screen
-    if screen_elements:
-        set_screen_opacity(screen_elements, 0.3)
-    
-    # Disable hover BEFORE opening popup
-    if button:
-        button.hover_enabled = False
-        button.bar.setVisible(False)
-        if button.anim and button.anim.state() == QPropertyAnimation.State.Running:
-            button.anim.stop()
-        button.bar.setGeometry((button.base_width - 0)//2, button.base_height, 0, button.bar_height)
-    
-    popup = PostToAllyPopup(parent)
-
-    def finished_handler(code):
-        user_confirmed = (code == QDialog.DialogCode.Accepted)
-        
-        # Restore full opacity
-        if screen_elements:
-            set_screen_opacity(screen_elements, 1.0)
-        
-        # Re-enable hover
-        if button:
-            QTimer.singleShot(100, lambda: setattr(button, 'hover_enabled', True))
-        
-        # Refocus parent
-        if parent:
-            parent.activateWindow()
-            parent.raise_()
-        
-        if user_confirmed:
-            selected_employee = popup.get_result()
-            print("✅ Selected employee:", selected_employee)
-
-            def run_post():
-                # Get labels from PDF preview (these are already in order)
-                if not pdf_preview or not pdf_preview.labels:
-                    print("❌ No PDF preview labels available")
-                    return
-                
-                pdf_labels = pdf_preview.labels  # List of labels like "foam board x 25"
-                
-                # Post each label with its corresponding barcode
-                from clientCalls import update_employee_task
-                
-                success_count = 0
-                fail_count = 0
-                
-                for idx, label in enumerate(pdf_labels):
-                    # Generate barcode: m + zero-padded index
-                    barcode = f"m{str(idx).zfill(10)}"
-                    
-                    response = update_employee_task(
-                        employeeName=selected_employee,
-                        liveTask=label,
-                        status="Pending",
-                        isobarcode=barcode,
-                        erase=False
-                    )
-                    
-                    if response.get("status") == "success":
-                        success_count += 1
-                        print(f"✅ Posted: {label} | Barcode: {barcode}")
-                    else:
-                        fail_count += 1
-                        print(f"❌ Failed to post: {label} - {response.get('message')}")
-                
-                print(f"\n📊 Summary: {success_count} tasks posted, {fail_count} failed")
-
-            threading.Thread(target=run_post).start()
-        else:
-            print("Posting canceled.")
-        
-        popup.deleteLater()
-    
-    popup.finished.connect(finished_handler)
-    popup.open()
-
+from PyQt6.QtWidgets import QDialog, QLabel, QTableWidget, QTableWidgetItem, QLineEdit, QAbstractItemView
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont, QBrush, QColor
 
 class PostToAllyPopup(QDialog):
+    """Original Ally popup, but with Shift/Ctrl multi-select enabled.
+    Styling and layout are unchanged; only selection + result payload differ.
+    - Call get_result() -> list[str] of selected employee names (may be empty).
+    """
     def __init__(self, parent=None, textbox_width=220, textbox_height=40, margin=16, btn_size=40):
         super().__init__(parent)
         self.parent_window = parent
@@ -1127,7 +1202,7 @@ class PostToAllyPopup(QDialog):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
         self.setStyleSheet("background-color: #3B3B3B;")
 
-        self.selected_employee = None
+        self._selected_employees = []
 
         # ---- Title ----
         self.title_label = QLabel("Post Tasks To Ally", self)
@@ -1154,8 +1229,9 @@ class PostToAllyPopup(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)  # single select
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        # *** Change: allow Shift/Ctrl multi-select ***
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
         # ---- Style ----
         self.table.setStyleSheet("""
@@ -1186,9 +1262,7 @@ class PostToAllyPopup(QDialog):
             QScrollBar::handle:vertical:hover {
                 background: white;
             }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
         """)
 
         # ---- Search bar row ----
@@ -1214,6 +1288,7 @@ class PostToAllyPopup(QDialog):
         # ---- Populate table ----
         self.populate_table()
 
+        # Double-click still accepts (collects multi-selection on accept)
         self.table.itemDoubleClicked.connect(lambda _: self._on_tick())
 
         # ---- Live filter ----
@@ -1242,6 +1317,22 @@ class PostToAllyPopup(QDialog):
         employees = fetch_all_employees()
         self.all_employees = [e.employeeName for e in employees]
 
+        # Optionally extend with facility workstations (first list only)
+        try:
+            ws_lists = get_facility_workstations()
+            if isinstance(ws_lists, (list, tuple)) and len(ws_lists) >= 1:
+                first_list = ws_lists[0] or []
+                # Coerce to strings and de-dup against employees
+                existing = set(n.lower() for n in self.all_employees)
+                for x in first_list:
+                    s = str(x).strip()
+                    if s and s.lower() not in existing:
+                        self.all_employees.append(s)
+                        existing.add(s.lower())
+        except Exception:
+            # If get_facility_workstations isn't imported yet, just skip.
+            pass
+
         self.table.setRowCount(len(self.all_employees) + 1)  # +1 for search bar
         for i, name in enumerate(self.all_employees, start=1):
             item = QTableWidgetItem(name)
@@ -1258,39 +1349,152 @@ class PostToAllyPopup(QDialog):
             match = text in item.text().lower()
             self.table.setRowHidden(row, not match)
 
-    def get_selected_employee(self):
-        """Return the first selected employee name, or None."""
-        selected = self.table.selectedItems()
-        if not selected:
-            return None
-        return selected[0].text()
+    # --- Multi-select helpers ---
+    def _selected_names(self) -> list:
+        rows = self.table.selectionModel().selectedRows()
+        names = []
+        for idx in rows:
+            it = self.table.item(idx.row(), 0)
+            if it:
+                t = it.text().strip()
+                if t:
+                    names.append(t)
+        return names
 
     def _on_tick(self):
-        self.selected_employee = self.get_selected_employee()
+        self._selected_employees = self._selected_names()
         self.accept()
 
     def _on_cross(self):
-        self.selected_employee = None
+        self._selected_employees = []
         self.reject()
 
     def get_result(self):
-        """Show popup and return selected employee name or None."""
-        return self.selected_employee
+        """Return list[str] of selected employees ([] if none)."""
+        return list(self._selected_employees)
+
+def exportToAlly(parent=None, button=None, task_table=None, pdf_preview=None,
+                 screen_elements=None, employee_field=None, owner=None):
+    """
+    UI-only multi-select Ally flow (no server calls):
+      1) Opens PostToAllyPopup with ExtendedSelection.
+      2) On confirm, writes selected names into `employee_field`.
+      3) NEW: auto-calls owner's send_and_update() to regenerate preview.
+    """
+    # Dim the screen
+    if screen_elements:
+        set_screen_opacity(screen_elements, 0.3)
+
+    # Disable hover BEFORE opening popup
+    if button:
+        try:
+            button.hover_enabled = False
+            button.bar.setVisible(False)
+            if getattr(button, 'anim', None) and button.anim.state() == QPropertyAnimation.State.Running:
+                button.anim.stop()
+            button.bar.setGeometry((button.base_width - 0)//2, button.base_height, 0, button.bar_height)
+        except Exception:
+            pass
+
+    popup = PostToAllyPopup(parent)
+
+    def _update_preview_after_popup(owner):
+        try:
+            employees = [
+                owner.employee_table.item(r, 0).text().strip()
+                for r in range(owner.employee_table.rowCount())
+                if owner.employee_table.item(r, 0)
+                and owner.employee_table.item(r, 0).text().strip()
+            ]
+            owner.pdf_preview.assign_employees_to_labels(employees, owner.task_table)
+            owner.pdf_preview.update()
+            print("✅ PDF preview refreshed after popup close.")
+        except Exception as e:
+            print(f"[WARN] Delayed preview update failed: {e}")
+
+
+    def finished_handler(code):
+        user_confirmed = (code == QDialog.DialogCode.Accepted)
+
+        # Restore screen and re-enable hover
+        if screen_elements:
+            set_screen_opacity(screen_elements, 1.0)
+        if button:
+            QTimer.singleShot(100, lambda: setattr(button, 'hover_enabled', True))
+
+        # Refocus parent window
+        if parent:
+            try:
+                parent.activateWindow()
+                parent.raise_()
+            except Exception:
+                pass
+
+        if user_confirmed:
+            selected = popup.get_result()  # list[str]
+            if employee_field is not None and selected:
+                if hasattr(employee_field, 'add_employees'):
+                    employee_field.add_employees(selected)
+                    if user_confirmed:
+                        selected = popup.get_result()  # list[str]
+                        if employee_field is not None and selected:
+                            if hasattr(employee_field, 'add_employees'):
+                                employee_field.add_employees(selected)
+                            else:
+                                prev = ''
+                                try:
+                                    prev = (employee_field.text() or '').strip()
+                                except Exception:
+                                    prev = ''
+                                new_lines = "\n".join(s for s in selected if s and s.strip())
+                                new_val = (prev + ("\n" if prev else "") + new_lines).strip()
+                                try:
+                                    employee_field.setText(new_val)
+                                except Exception:
+                                    pass
+
+                        # ✅ Schedule preview update *after* popup fully closes and table updates
+                        if owner and hasattr(owner, "pdf_preview"):
+                            QTimer.singleShot(200, lambda: _update_preview_after_popup(owner))
+
+                else:
+                    prev = ''
+                    try:
+                        prev = (employee_field.text() or '').strip()
+                    except Exception:
+                        prev = ''
+                    new_lines = "\n".join(s for s in selected if s and s.strip())
+                    new_val = (prev + ("\n" if prev else "") + new_lines).strip()
+                    try:
+                        employee_field.setText(new_val)
+                    except Exception:
+                        pass
+
+            # NEW: regenerate the PDF preview immediately
+            try:
+                if owner and hasattr(owner, 'send_and_update'):
+                    QTimer.singleShot(0, owner.send_and_update)
+            except Exception:
+                pass
+
+        popup.deleteLater()
+
+    popup.finished.connect(finished_handler)
+    popup.open()
 
 class LiveTaskTable(QTableWidget):
     def __init__(self, parent, x, y, width, height, header_font: QFont):
         super().__init__(parent)
         self.setGeometry(x, y, width, height)
-        self.setColumnCount(3)
-        self.setHorizontalHeaderLabels(["Employee", "Task", "Status"])
+        self.setColumnCount(4)
+        self.setHorizontalHeaderLabels(["Employee", "Task", "Status", "Barcode"])
         self.verticalHeader().setVisible(False)
         self.setFrameShape(QTableWidget.Shape.Box)
         self.setFrameShadow(QTableWidget.Shadow.Plain)
         self.setLineWidth(1)
         self.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  # Read-only
-
+        self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.setShowGrid(True)
         self.setStyleSheet("""
             QTableWidget { 
@@ -1309,459 +1513,618 @@ class LiveTaskTable(QTableWidget):
                 border:1px solid white;
             }
         """)
-
         self.horizontalHeader().setFont(header_font)
-        
-        # Column widths: distribute evenly
-        col_width = width // 3
-        self.setColumnWidth(0, col_width)
-        self.setColumnWidth(1, col_width)
-        self.setColumnWidth(2, col_width)
-        self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+
+        # Adjust column widths
+        col_width = width // 4
+        for i in range(4):
+            self.setColumnWidth(i, col_width)
+            self.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
 
         # Add search bars as first row
         self.insertRow(0)
-        
-        self.search_employee = QLineEdit()
-        self.search_employee.setPlaceholderText("Search employee...")
-        self.search_employee.setStyleSheet("""
-            QLineEdit {
-                background-color: #3B3B3B;
-                color: white;
-                border: 1px solid white;
-                padding: 4px;
-                selection-background-color: #1AA0FF;
-            }
-        """)
+
+        # --- Search Bars ---
+        def make_search_box(placeholder):
+            box = QLineEdit()
+            box.setPlaceholderText(placeholder)
+            box.setStyleSheet("""
+                QLineEdit {
+                    background-color: #3B3B3B;
+                    color: white;
+                    border: 1px solid white;
+                    padding: 4px;
+                    selection-background-color: #1AA0FF;
+                }
+            """)
+            return box
+
+        self.search_employee = make_search_box("Search employee...")
+        self.search_task = make_search_box("Search task...")
+        self.search_status = make_search_box("Search status...")
+        self.search_barcode = make_search_box("Search barcode...")
+
         self.setCellWidget(0, 0, self.search_employee)
-        
-        self.search_task = QLineEdit()
-        self.search_task.setPlaceholderText("Search task...")
-        self.search_task.setStyleSheet("""
-            QLineEdit {
-                background-color: #3B3B3B;
-                color: white;
-                border: 1px solid white;
-                padding: 4px;
-                selection-background-color: #1AA0FF;
-            }
-        """)
         self.setCellWidget(0, 1, self.search_task)
-        
-        self.search_status = QLineEdit()
-        self.search_status.setPlaceholderText("Search status...")
-        self.search_status.setStyleSheet("""
-            QLineEdit {
-                background-color: #3B3B3B;
-                color: white;
-                border: 1px solid white;
-                padding: 4px;
-                selection-background-color: #1AA0FF;
-            }
-        """)
         self.setCellWidget(0, 2, self.search_status)
-        
+        self.setCellWidget(0, 3, self.search_barcode)
+
         # Connect search bars to filter
         self.search_employee.textChanged.connect(self.filter_tasks)
         self.search_task.textChanged.connect(self.filter_tasks)
         self.search_status.textChanged.connect(self.filter_tasks)
-        
-        # Store all tasks for filtering
+        self.search_barcode.textChanged.connect(self.filter_tasks)
+
         self.all_tasks = []
 
-    def mousePressEvent(self, event: QMouseEvent):
-        item = self.itemAt(event.pos())
-        if item is None:
-            self.clearSelection()
-            self.itemSelectionChanged.emit()
-        else:
-            super().mousePressEvent(event)
-
     def filter_tasks(self):
-        """Filter tasks based on all three search bars."""
+        """Filter tasks based on all four search bars."""
         employee_text = self.search_employee.text().strip().lower()
         task_text = self.search_task.text().strip().lower()
         status_text = self.search_status.text().strip().lower()
-        
-        # Filter rows (skip row 0 which contains search bars)
+        barcode_text = self.search_barcode.text().strip().lower()
+
         for row in range(1, self.rowCount()):
             employee_item = self.item(row, 0)
             task_item = self.item(row, 1)
             status_item = self.item(row, 2)
-            
-            # Check if all search criteria match
+            barcode_item = self.item(row, 3)
+
             employee_match = not employee_text or (employee_item and employee_text in employee_item.text().lower())
             task_match = not task_text or (task_item and task_text in task_item.text().lower())
             status_match = not status_text or (status_item and status_text in status_item.text().lower())
-            
-            # Show row only if ALL criteria match
-            show_row = employee_match and task_match and status_match
+            barcode_match = not barcode_text or (barcode_item and barcode_text in barcode_item.text().lower())
+
+            show_row = employee_match and task_match and status_match and barcode_match
             self.setRowHidden(row, not show_row)
 
     def populate_tasks(self, tasks):
         """Populate the table with task data."""
+        print("\n[DEBUG] Populating LiveTaskTable with tasks:")
+        for idx, row in enumerate(tasks):
+            print(f"  Row {idx}: {row}")
+        print(f"  → Total rows: {len(tasks)}\n")
+
         self.all_tasks = tasks
-        
-        # Clear existing rows except search bar
         self.setRowCount(1)
-        
+
         if not tasks:
-            # Show empty placeholder
             self.insertRow(1)
             item = QTableWidgetItem("[NO TASKS FOUND]")
             item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             item.setForeground(QBrush(QColor("white")))
             self.setItem(1, 0, item)
-            self.setSpan(1, 0, 1, 3)  # Span across all columns
+            self.setSpan(1, 0, 1, 4)
             return
-        
-        # Populate with tasks
-        for i, task_row in enumerate(tasks, start=1):
-            if len(task_row) < 3:
-                continue
-            
-            # Unpack first 3 values, ignore isobarcode (4th value)
-            employee_name = task_row[0]
-            live_task = task_row[1]
-            status = task_row[2]
-            # task_row[3] would be isobarcode, but we ignore it for now
-            self.insertRow(i)
-            
-            # Employee column
-            employee_item = QTableWidgetItem(employee_name)
-            employee_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            employee_item.setForeground(QBrush(QColor("white")))
-            employee_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-            self.setItem(i, 0, employee_item)
-            
-            # Task column
-            task_item = QTableWidgetItem(live_task)
-            task_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            task_item.setForeground(QBrush(QColor("white")))
-            task_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-            self.setItem(i, 1, task_item)
-            
-            # Status column
-            status_item = QTableWidgetItem(status)
-            status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            status_item.setForeground(QBrush(QColor("white")))
-            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.setItem(i, 2, status_item)
 
-# ---------------- Manual Task Screen ----------------
+        for i, task_row in enumerate(tasks, start=1):
+            if len(task_row) < 4:
+                print(f"[DEBUG] Skipping malformed task row at index {i}: {task_row}")
+                continue
+
+            employee_name, live_task, status, barcode = task_row[:4]
+            self.insertRow(i)
+
+            # Helper to build cells cleanly
+            def make_item(text, align_center=False):
+                item = QTableWidgetItem(text)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                item.setForeground(QBrush(QColor("white")))
+                align = Qt.AlignmentFlag.AlignCenter if align_center else (Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                item.setTextAlignment(align)
+                return item
+
+            self.setItem(i, 0, make_item(employee_name))
+            self.setItem(i, 1, make_item(live_task))
+            self.setItem(i, 2, make_item(status, align_center=True))
+            self.setItem(i, 3, make_item(barcode, align_center=True))
+
+
+class EmployeeAssignmentTable(QTableWidget):
+    def __init__(self, parent=None, width=260, height=120, header_text="Task Assignment"):
+        super().__init__(parent)
+        self.setColumnCount(1)
+        self.setHorizontalHeaderLabels([header_text])
+        self.verticalHeader().setVisible(False)
+        self.horizontalHeader().setStretchLastSection(True)
+        self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.setFixedSize(width, height)
+        self.on_changed = None
+
+        # Dark styling to match app
+        self.setStyleSheet(
+            """
+            QTableWidget { 
+                background-color: rgba(59,59,59,178); 
+                color:white; 
+                border:1px solid white; 
+                gridline-color: white;
+            }
+            QTableWidget::item:selected { 
+                background-color: #1AA0FF; 
+                color:white; 
+            }
+            QHeaderView::section { 
+                background-color: rgba(59,59,59,255); 
+                color:white; 
+                border:1px solid white;
+            }
+            """
+        )
+
+    def _current_items_set(self):
+        items = set()
+        for r in range(self.rowCount()):
+            it = self.item(r, 0)
+            if it:
+                items.add(it.text().strip().lower())
+        return items
+
+    def add_employees(self, names):
+        if not names:
+            return
+        existing = self._current_items_set()
+        for name in names:
+            norm = (name or "").strip()
+            if not norm:
+                continue
+            key = norm.lower()
+            if key in existing:
+                continue
+            row = self.rowCount()
+            self.insertRow(row)
+            if callable(self.on_changed):
+                self.on_changed()
+            item = QTableWidgetItem(norm)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            item.setForeground(QBrush(QColor("white")))
+            self.setItem(row, 0, item)
+            existing.add(key)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            sel = self.selectedItems()
+            if sel:
+                row = sel[0].row()
+                self.removeRow(row)
+                if callable(self.on_changed):
+                    self.on_changed()
+                return
+        super().keyPressEvent(event)
+
 class manualTaskScreen:
     def __init__(self, window, return_to_menu=None):
         self.window = window
+        self.return_to_menu = return_to_menu
+
+        # Element tracking for animations/layout mode toggles
         self.elements = []
         self.manual_ui_elements = []
         self.live_ui_elements = []
         self.orig_positions = {}
-        self.return_to_menu = return_to_menu
+
+        # State
         self.current_ui_mode = "Manual Task Generation"
-        # REMOVE: self.overlay = OverlayWidget(self.window)
+
         self.setup_ui()
 
+    # ---------------- UI ----------------
     def setup_ui(self):
         w, h = self.window.window_width, self.window.window_height
         padding = 10
-        
-        # Calculate task table width FIRST (we need this for mode dial sizing)
+
+        # Width for the task table (also used for ModeDial target width)
         table_width = int(w * 0.3)
-        
+
         # ---------------- Home Button ----------------
         btn_path = resource_path("images/homeIcon.png")
         home_btn = AnimatedBarButton(btn_path, self.on_home_clicked, self.window, scale_factor=0.25)
         home_btn.move(w - home_btn.width() - padding, self.window.title_bar_height + padding)
         home_btn.show()
         self.elements.append(home_btn)
-        
+
         # ---------------- Mode Dial ----------------
-        # Make mode dial the same width as the task table
-        self.mode_dial = ModeDial(
-            self.window, 
-            window_width=w, 
-            height=home_btn.height(),
-            target_width=table_width  # Now table_width is defined!
-        )
+        self.mode_dial = ModeDial(self.window, window_width=w, height=home_btn.height(), target_width=table_width)
         self.mode_dial.move(padding, self.window.title_bar_height + padding)
         self.mode_dial.show()
         self.elements.append(self.mode_dial)
-        
-        # Store original next_mode function
+
         original_next_mode = self.mode_dial.next_mode
-        
         def next_mode_with_slide():
-            # Perform actual mode change
             old_mode = self.current_ui_mode
             original_next_mode()
             new_mode = self.mode_dial.MODES[self.mode_dial.current_index]
             self.current_ui_mode = new_mode
             QTimer.singleShot(0, lambda: self.handle_mode_change(old_mode, new_mode))
-        
-        # Replace the dial's next_mode with our wrapped version
         self.mode_dial.next_mode = next_mode_with_slide
-        
+
         # ---------------- Manual Task Generation UI ----------------
         y_offset = self.mode_dial.y() + self.mode_dial.height() + padding
-        
-        # Task Table (now using table_width we calculated earlier)
+
+        # Task table (left)
         table_x, table_y = padding, y_offset
         table_height = h - table_y - padding
-        
         header_font = QFont()
         header_font.setPointSize(int(h * 0.025))
         header_font.setBold(True)
-        
+
         self.task_table = TaskTable(self.window, table_x, table_y, table_width, table_height, header_font)
         self.task_table.show()
         self.elements.append(self.task_table)
-        self.manual_ui_elements.append(self.task_table)  # ADD TO MANUAL UI
-        self.orig_positions[self.task_table] = self.task_table.pos()  # STORE POSITION
-        
-        # Connect table changes to button state updates
-        self.task_table.itemChanged.connect(lambda: self.update_button_states())
-        self.task_table.itemSelectionChanged.connect(lambda: self.update_button_states())
+        self.manual_ui_elements.append(self.task_table)
+        self.orig_positions[self.task_table] = self.task_table.pos()
+
+        # React to table changes
+        try:
+            self.task_table.itemChanged.connect(lambda: self.update_button_states())
+            self.task_table.itemSelectionChanged.connect(lambda: self.update_button_states())
+        except Exception:
+            pass
 
         # ---------------- PDF Preview ----------------
         pdf_height = table_height
-        pdf_width = int((pdf_height / 1.414)*1.1)
-        pdf_x = table_x + table_width + int(w*0.08)
+        pdf_width = int((pdf_height / 1.414) * 1.1)
+        pdf_x = table_x + table_width + int(w * 0.08)
         pdf_y = table_y
 
-        # Create background frame box
         self.pdf_frame = QWidget(self.window)
         self.pdf_frame.setGeometry(pdf_x, pdf_y, pdf_width, pdf_height)
-        self.pdf_frame.setStyleSheet("""
-            background-color: rgba(59,59,59,178);
-            border: 1px solid white;
-        """)
+        self.pdf_frame.setStyleSheet("background-color: rgba(59,59,59,178); border: 1px solid white;")
         self.pdf_frame.show()
         self.elements.append(self.pdf_frame)
-        self.manual_ui_elements.append(self.pdf_frame)  # ADD TO MANUAL UI
-        self.orig_positions[self.pdf_frame] = self.pdf_frame.pos()  # STORE POSITION
+        self.manual_ui_elements.append(self.pdf_frame)
+        self.orig_positions[self.pdf_frame] = self.pdf_frame.pos()
 
-        # Add page counter label
         self.page_counter_label = QLabel("Page 1 of 1", self.pdf_frame)
         self.page_counter_label.setStyleSheet("color: white; background-color: transparent;")
         self.page_counter_label.setFont(QFont("Arial", 10, QFont.Weight.Bold))
         self.page_counter_label.setGeometry(10, 10, 150, 25)
         self.page_counter_label.show()
 
-        # Create PDF preview
         preview_width = int((pdf_height / 1.414) * 0.8)
         preview_height = int(pdf_height * 0.8)
         preview_x = pdf_x + (pdf_width - preview_width) // 2
         preview_y = pdf_y + (pdf_height - preview_height) // 2
 
-        self.pdf_preview = PDFPreview(
-            parent=self.window,
-            x=preview_x,
-            y=preview_y,
-            width=preview_width,
-            height=preview_height
-        )
+        self.pdf_preview = PDFPreview(self.window, preview_x, preview_y, preview_width, preview_height)
         self.pdf_preview.show()
         self.elements.append(self.pdf_preview)
-        self.manual_ui_elements.append(self.pdf_preview)  # ADD TO MANUAL UI
-        self.orig_positions[self.pdf_preview] = self.pdf_preview.pos()  # STORE POSITION
-
-        # Connect page change to update counter
+        self.manual_ui_elements.append(self.pdf_preview)
+        self.orig_positions[self.pdf_preview] = self.pdf_preview.pos()
         self.pdf_preview.page_changed = lambda: self.update_page_counter()
 
-        # ---------------- Create All Buttons ----------------
+        # ---------------- Buttons ----------------
+        # Create / Delete (between columns)
         create_btn_path = resource_path("images/addStation.png")
-        create_btn = AnimatedBarButton(
-            create_btn_path,
-            None,
-            self.window,
-            scale_factor=0.25
-        )
+        create_btn = AnimatedBarButton(create_btn_path, None, self.window, scale_factor=0.25)
         create_btn.callback = lambda btn=create_btn: createNewTask(self.window, btn, self.task_table, self.elements)
 
         delete_btn_path = resource_path("images/binicon.png")
-        self.delete_btn = AnimatedBarButton(
-            delete_btn_path,
-            lambda: self.delete_selected_task(),
-            self.window,
-            scale_factor=0.25
-        )
+        self.delete_btn = AnimatedBarButton(delete_btn_path, lambda: self.delete_selected_task(), self.window, scale_factor=0.25)
 
-        middle_btn_path = resource_path("images/sendBarcodes.png")
-        self.middle_btn = AnimatedBarButton(
-            middle_btn_path,
-            lambda: self.send_and_update(),
-            self.window,
-            scale_factor=0.25
-        )
-
+        # Save (right column)
         export_btn_path = resource_path("images/save.png")
-        self.export_btn = AnimatedBarButton(
-            export_btn_path,
-            self.export_to_pdf,
-            self.window,
-            scale_factor=0.25
+        self.export_btn = AnimatedBarButton(export_btn_path, self.export_to_pdf, self.window, scale_factor=0.25)
+
+        # Ally (right column, top)
+        ally_btn_path = resource_path("images/addEmp.png")
+        self.ally_btn = AnimatedBarButton(ally_btn_path, None, self.window, scale_factor=0.25)
+        self.ally_btn.callback = lambda btn=self.ally_btn: exportToAlly(
+            self.window, btn, self.task_table, self.pdf_preview, self.elements,
+            getattr(self, "employee_table", None),  # <-- defer lookup
+            owner=self
         )
 
-        ally_btn_path = resource_path("images/sendToAlly.png")
-        self.ally_btn = AnimatedBarButton(
-            ally_btn_path,
-            None,
-            self.window,
-            scale_factor=0.25
-        )
-        self.ally_btn.callback = lambda btn=self.ally_btn: exportToAlly(self.window, btn, self.task_table, self.pdf_preview, self.elements)
+        # NEW: Activate (server posting)
+        activate_btn_path = resource_path("images/sendToAlly.png")
+        self.activate_btn = AnimatedBarButton(activate_btn_path, None, self.window, scale_factor=0.25)
+        self.activate_btn.callback = lambda btn=self.activate_btn: self.activate_assigned_tasks()
+        print("[DBG] activate_btn callback wired", flush=True)
 
-        # Disable buttons initially
-        self.middle_btn.setEnabled(False)
+
+
+        # Initial states
         self.export_btn.setEnabled(False)
         self.ally_btn.setEnabled(False)
         self.delete_btn.setEnabled(False)
+        self.activate_btn.setEnabled(False)
 
-        # Show all buttons
-        for b in (create_btn, self.delete_btn, self.middle_btn, self.export_btn, self.ally_btn):
+        for b in (create_btn, self.delete_btn, self.export_btn, self.ally_btn, self.activate_btn):
             b.show()
 
-        # ---------------- Position All Buttons ----------------
+        # ---------------- Button Layout ----------------
+        # geometry helpers
         table_right = self.task_table.x() + self.task_table.width()
         pdf_left = self.pdf_frame.x()
-        pdf_right = self.pdf_frame.x() + self.pdf_frame.width()
-        table_center_y = self.task_table.y() + self.task_table.height() // 2
-        table_top = self.task_table.y()
-
-        # Calculate middle button width early (we'll need it for alignment)
         gap_between_table_pdf = pdf_left - table_right
-        mb_w, mb_h = self.middle_btn.width(), self.middle_btn.height()
-        if mb_w == 0 or mb_h == 0:
-            sh = self.middle_btn.sizeHint()
-            mb_w, mb_h = sh.width(), sh.height()
-
-        middle_btn_x = table_right + (gap_between_table_pdf - mb_w) // 2
-
-        # --- Create + Delete buttons (left of middle) ---
-        create_w, create_h = create_btn.width(), create_btn.height()
-        if create_w == 0 or create_h == 0:
-            sh = create_btn.sizeHint()
-            create_w, create_h = sh.width(), sh.height()
-
-        delete_w, delete_h = self.delete_btn.width(), self.delete_btn.height()
-        if delete_w == 0 or delete_h == 0:
-            sh = self.delete_btn.sizeHint()
-            delete_w, delete_h = sh.width(), sh.height()
-
-        create_x = middle_btn_x
-        delete_x = middle_btn_x
-        create_y = table_top
         vertical_gap = 20
-        delete_y = create_y + create_h + vertical_gap
 
-        # Move Create button
-        create_btn.move(create_x, create_y)
-        create_btn.orig_x = create_btn.x()
-        create_btn.orig_y = create_btn.y()
-        self.elements.append(create_btn)
-        self.manual_ui_elements.append(create_btn)
+        # ensure we have real widths (sizeHint fallback if needed)
+        def _btn_size(btn):
+            w, h = btn.width(), btn.height()
+            if not w or not h:
+                sh = btn.sizeHint()
+                return sh.width(), sh.height()
+            return w, h
+
+        cr_w, cr_h = _btn_size(create_btn)
+        dl_w, dl_h = _btn_size(self.delete_btn)
+        al_w, al_h = _btn_size(self.ally_btn)
+        ac_w, ac_h = _btn_size(self.activate_btn)
+        sv_w, sv_h = _btn_size(self.export_btn)
+
+        # use the widest button to center the column nicely
+        max_w = max(cr_w, dl_w, al_w, ac_w, sv_w)
+
+        # compute the common X so the column is horizontally centered in the gap
+        middle_x = table_right + (gap_between_table_pdf - max_w) // 2
+
+        # starting Y aligned with top of the task table
+        y = self.task_table.y()
+
+        # 1) Create
+        create_btn.move(middle_x, y)
+        create_btn.orig_x, create_btn.orig_y = create_btn.x(), create_btn.y()
+        if create_btn not in self.elements: self.elements.append(create_btn)
+        if create_btn not in self.manual_ui_elements: self.manual_ui_elements.append(create_btn)
         self.orig_positions[create_btn] = create_btn.pos()
 
-        # Move Delete button
-        self.delete_btn.move(delete_x, delete_y)
-        self.delete_btn.orig_x = self.delete_btn.x()
-        self.delete_btn.orig_y = self.delete_btn.y()
-        self.elements.append(self.delete_btn)
-        self.manual_ui_elements.append(self.delete_btn)
+        # 2) Delete
+        y += cr_h + vertical_gap
+        self.delete_btn.move(middle_x, y)
+        self.delete_btn.orig_x, self.delete_btn.orig_y = self.delete_btn.x(), self.delete_btn.y()
+        if self.delete_btn not in self.elements: self.elements.append(self.delete_btn)
+        if self.delete_btn not in self.manual_ui_elements: self.manual_ui_elements.append(self.delete_btn)
         self.orig_positions[self.delete_btn] = self.delete_btn.pos()
 
-        # --- Middle button BELOW Delete ---
-        middle_btn_y = delete_y + delete_h + vertical_gap
-
-        self.middle_btn.move(middle_btn_x, middle_btn_y)
-        self.middle_btn.orig_x = self.middle_btn.x()
-        self.middle_btn.orig_y = self.middle_btn.y()
-        self.elements.append(self.middle_btn)
-        self.manual_ui_elements.append(self.middle_btn)
-        self.orig_positions[self.middle_btn] = self.middle_btn.pos()
-
-        # --- Export + Ally buttons (right of PDF) ---
-        ex_w, ex_h = self.export_btn.width(), self.export_btn.height()
-        al_w, al_h = self.ally_btn.width(), self.ally_btn.height()
-
-        if ex_w == 0 or ex_h == 0:
-            sh = self.export_btn.sizeHint()
-            ex_w, ex_h = sh.width(), sh.height()
-        if al_w == 0 or al_h == 0:
-            sh = self.ally_btn.sizeHint()
-            al_w, al_h = sh.width(), sh.height()
-
-        # Keep existing horizontal layout to the right of PDF
-        horizontal_gap = (gap_between_table_pdf - mb_w) // 2
-        export_x = pdf_right + horizontal_gap
-        ally_x = export_x  # aligned vertically
-
-        # ✅ Match Y positions with Create and Delete buttons
-        export_y = create_y
-        ally_y = delete_y
-
-        # Move Export button
-        self.export_btn.move(export_x, export_y)
-        self.export_btn.orig_x = self.export_btn.x()
-        self.export_btn.orig_y = self.export_btn.y()
-        self.elements.append(self.export_btn)
-        self.manual_ui_elements.append(self.export_btn)
-        self.orig_positions[self.export_btn] = self.export_btn.pos()
-
-        # Move Ally button
-        self.ally_btn.move(ally_x, ally_y)
-        self.ally_btn.orig_x = self.ally_btn.x()
-        self.ally_btn.orig_y = self.ally_btn.y()
-        self.elements.append(self.ally_btn)
-        self.manual_ui_elements.append(self.ally_btn)
+        # 3) Ally
+        ally_x = middle_x
+        y += dl_h + vertical_gap
+        self.ally_btn.move(middle_x, y)
+        self.ally_btn.orig_x, self.ally_btn.orig_y = self.ally_btn.x(), self.ally_btn.y()
+        if self.ally_btn not in self.elements: self.elements.append(self.ally_btn)
+        if self.ally_btn not in self.manual_ui_elements: self.manual_ui_elements.append(self.ally_btn)
         self.orig_positions[self.ally_btn] = self.ally_btn.pos()
 
-        # Initial button state check
+        # 4) Activate
+        y += al_h + vertical_gap
+        self.activate_btn.move(middle_x, y)
+        self.activate_btn.orig_x, self.activate_btn.orig_y = self.activate_btn.x(), self.activate_btn.y()
+        if self.activate_btn not in self.elements: self.elements.append(self.activate_btn)
+        if self.activate_btn not in self.manual_ui_elements: self.manual_ui_elements.append(self.activate_btn)
+        self.orig_positions[self.activate_btn] = self.activate_btn.pos()
+
+        # 5) Save
+        y += ac_h + vertical_gap
+        self.export_btn.move(middle_x, y)
+        self.export_btn.orig_x, self.export_btn.orig_y = self.export_btn.x(), self.export_btn.y()
+        if self.export_btn not in self.elements: self.elements.append(self.export_btn)
+        if self.export_btn not in self.manual_ui_elements: self.manual_ui_elements.append(self.export_btn)
+        self.orig_positions[self.export_btn] = self.export_btn.pos()
+
+        # ===== Assigned table to the RIGHT of the button column; PDF shifts further right =====
+        side_gap = 16
+
+        assign_x = middle_x + max_w + side_gap        # immediately to the right of the buttons
+        assign_y = self.task_table.y()                # top edge aligned with Create
+
+        # Fill down to the same bottom as the task table
+        bottom_target = table_y + table_height
+        table_width_px  = max(260, int(w * 0.16))     # sane width; adjust if you like
+        table_height_px = max(80, bottom_target - assign_y)
+
+        # Create / move the assignment table
+        if hasattr(self, "employee_table") and self.employee_table is not None:
+            self.employee_table.setFixedSize(table_width_px, table_height_px)
+            self.employee_table.move(assign_x, assign_y)
+        else:
+            self.employee_table = EmployeeAssignmentTable(
+                self.window, width=table_width_px, height=table_height_px, header_text="Task Assignment"
+            )
+            self.employee_table.move(assign_x, assign_y)
+            self.employee_table.show()
+            self.elements.append(self.employee_table)
+            self.manual_ui_elements.append(self.employee_table)
+
+        self.orig_positions[self.employee_table] = self.employee_table.pos()
+        self.employee_table.on_changed = self.update_button_states
+
+        # ---- Shift the PDF frame & preview further right to make room ----
+        new_pdf_x = assign_x + table_width_px + side_gap
+        pdf_y     = self.pdf_frame.y()     # unchanged
+        pdf_w     = self.pdf_frame.width() # keep same width/height
+        pdf_h     = self.pdf_frame.height()
+
+        self.pdf_frame.move(new_pdf_x, pdf_y)
+        self.orig_positions[self.pdf_frame] = self.pdf_frame.pos()
+
+        # Re-center the PDFPreview within the moved frame
+        prev_w, prev_h = self.pdf_preview.width(), self.pdf_preview.height()
+        new_prev_x = self.pdf_frame.x() + (pdf_w - prev_w) // 2
+        new_prev_y = self.pdf_frame.y() + (pdf_h - prev_h) // 2
+        self.pdf_preview.move(new_prev_x, new_prev_y)
+        self.orig_positions[self.pdf_preview] = self.pdf_preview.pos()
+
+        vertical_gap = 20
+
+        # 1) Compute intrinsic widths
+        def _btn_size(btn):
+            w_, h_ = btn.width(), btn.height()
+            if not w_ or not h_:
+                sh = btn.sizeHint()
+                return sh.width(), sh.height()
+            return w_, h_
+
+        # Buttons column width = widest button
+        cr_w, cr_h = _btn_size(create_btn)
+        dl_w, dl_h = _btn_size(self.delete_btn)
+        al_w, al_h = _btn_size(self.ally_btn)
+        ac_w, ac_h = _btn_size(self.activate_btn)
+        sv_w, sv_h = _btn_size(self.export_btn)
+        buttons_col_w = max(cr_w, dl_w, al_w, ac_w, sv_w)
+
+        # Assigned table target width (keep your previous choice / scale with window)
+        assigned_w = max(260, int(w * 0.16))
+
+        # PDF frame keeps its existing size; we’ll only move it
+        pdf_w, pdf_h = self.pdf_frame.width(), self.pdf_frame.height()
+
+        # 2) Solve equal gap G across the 4 columns
+        # layout: [padding] TaskTable [G] Buttons [G] Assigned [G] PDF [padding]
+        usable = w - 2 * padding
+        total_fixed = table_width + buttons_col_w + assigned_w + pdf_w
+        G = max(8, int((usable - total_fixed) / 3*0.6))  # >= 8px minimum gap
+
+        # 3) Compute left edges for each column
+        x_task     = table_x  # already padding-aligned
+        x_buttons  = x_task + table_width + G
+        x_assign   = x_buttons + buttons_col_w + G
+        x_pdf      = x_assign + assigned_w + G
+
+        # 4) Place the BUTTONS as a vertical stack at x_buttons (top aligned to task table)
+        y = table_y
+        create_btn.move(x_buttons, y)
+        create_btn.orig_x, create_btn.orig_y = create_btn.x(), create_btn.y()
+        self.orig_positions[create_btn] = create_btn.pos()
+        if create_btn not in self.elements: self.elements.append(create_btn)
+        if create_btn not in self.manual_ui_elements: self.manual_ui_elements.append(create_btn)
+
+        y += cr_h + vertical_gap
+        self.delete_btn.move(x_buttons, y)
+        self.delete_btn.orig_x, self.delete_btn.orig_y = self.delete_btn.x(), self.delete_btn.y()
+        self.orig_positions[self.delete_btn] = self.delete_btn.pos()
+        if self.delete_btn not in self.elements: self.elements.append(self.delete_btn)
+        if self.delete_btn not in self.manual_ui_elements: self.manual_ui_elements.append(self.delete_btn)
+
+        y += dl_h + vertical_gap
+        self.ally_btn.move(x_buttons, y)
+        self.ally_btn.orig_x, self.ally_btn.orig_y = self.ally_btn.x(), self.ally_btn.y()
+        self.orig_positions[self.ally_btn] = self.ally_btn.pos()
+        if self.ally_btn not in self.elements: self.elements.append(self.ally_btn)
+        if self.ally_btn not in self.manual_ui_elements: self.manual_ui_elements.append(self.ally_btn)
+
+        y += al_h + vertical_gap
+        self.activate_btn.move(x_buttons, y)
+        self.activate_btn.orig_x, self.activate_btn.orig_y = self.activate_btn.x(), self.activate_btn.y()
+        self.orig_positions[self.activate_btn] = self.activate_btn.pos()
+        if self.activate_btn not in self.elements: self.elements.append(self.activate_btn)
+        if self.activate_btn not in self.manual_ui_elements: self.manual_ui_elements.append(self.activate_btn)
+
+        y += ac_h + vertical_gap
+        self.export_btn.move(x_buttons, y)
+        self.export_btn.orig_x, self.export_btn.orig_y = self.export_btn.x(), self.export_btn.y()
+        self.orig_positions[self.export_btn] = self.export_btn.pos()
+        if self.export_btn not in self.elements: self.elements.append(self.export_btn)
+        if self.export_btn not in self.manual_ui_elements: self.manual_ui_elements.append(self.export_btn)
+
+        # 5) Assigned table to the RIGHT of buttons, top aligned with Create
+        assign_y = table_y
+        assigned_h = max(80, (table_y + table_height) - assign_y)  # bottom-align with task table
+        if hasattr(self, "employee_table") and self.employee_table is not None:
+            self.employee_table.setFixedSize(assigned_w, assigned_h)
+            self.employee_table.move(x_assign, assign_y)
+        else:
+            self.employee_table = EmployeeAssignmentTable(
+                self.window, width=assigned_w, height=assigned_h, header_text="Task Assignment"
+            )
+            self.employee_table.move(x_assign, assign_y)
+            self.employee_table.show()
+            self.elements.append(self.employee_table)
+            self.manual_ui_elements.append(self.employee_table)
+        self.orig_positions[self.employee_table] = self.employee_table.pos()
+
+        # 6) Shift the PDF frame to x_pdf (size unchanged)
+        self.pdf_frame.move(x_pdf, self.pdf_frame.y())
+        self.orig_positions[self.pdf_frame] = self.pdf_frame.pos()
+
+        # Re-center the PDFPreview within the moved frame (keeping its size)
+        prev_w, prev_h = self.pdf_preview.width(), self.pdf_preview.height()
+        new_prev_x = self.pdf_frame.x() + (pdf_w - prev_w) // 2
+        new_prev_y = self.pdf_frame.y() + (pdf_h - prev_h) // 2
+        self.pdf_preview.move(new_prev_x, new_prev_y)
+        self.orig_positions[self.pdf_preview] = self.pdf_preview.pos()
+
+
+        # Final state sync & live view init
         self.update_button_states()
-
-        # ---------------- Live Ally Tasks UI ----------------
         self.create_live_tasks_table()
-
-        # Populate live tasks data once on startup
         QTimer.singleShot(0, self.populate_live_tasks)
-        
+
+    def show_tasks_live_popup(self):
+        # Dim the screen (identical helper used by NewTaskPopup flow)
+        if hasattr(self, "elements"):
+            set_screen_opacity(self.elements, 0.3)
+
+        popup = LiveSuccessPopup(self.window, message="Your Tasks are now Live!")
+
+        def finished_handler(code):
+            # Restore full opacity (identical to createNewTask)
+            if hasattr(self, "elements"):
+                set_screen_opacity(self.elements, 1.0)
+
+            # Refocus parent (same as createNewTask)
+            if self.window:
+                try:
+                    self.window.activateWindow()
+                    self.window.raise_()
+                except Exception:
+                    pass
+
+            popup.deleteLater()
+
+        popup.finished.connect(finished_handler)
+        popup.open()  # non-blocking, identical to createNewTask
+
+
+
 
     def update_button_states(self):
         """Enable/disable buttons based on table and preview state."""
-        # Check if table has any valid barcodes (non-zero in Barcodes column)
+        # Any non-zero value in the Barcodes column?
         has_barcodes_in_table = False
         for row in range(self.task_table.rowCount()):
-            barcode_item = self.task_table.item(row, 2)  # Barcodes column
-            if barcode_item:
+            it = self.task_table.item(row, 2)  # Barcodes column
+            if it:
                 try:
-                    barcode_count = int(barcode_item.text())
-                    if barcode_count > 0:
+                    if int(it.text()) > 0:
                         has_barcodes_in_table = True
                         break
                 except ValueError:
                     continue
-        
-        # Check if preview has any labels
+
         has_preview_labels = len(self.pdf_preview.labels) > 0
-        
-        # Check if a task is selected in the table
         has_task_selected = bool(self.task_table.selectedItems())
-        
-        # Update button states
-        self.middle_btn.setEnabled(has_barcodes_in_table)
-        self.export_btn.setEnabled(has_preview_labels)
-        self.ally_btn.setEnabled(has_preview_labels)
-        self.delete_btn.setEnabled(has_task_selected)  # NEW: disable delete until selection
+
+        # Ally (UI-only) – leave as you had it; requires preview labels
+        self.ally_btn.setEnabled(has_barcodes_in_table)
+
+        # Delete requires a selected row
+        self.delete_btn.setEnabled(has_task_selected)
+
+        # NEW: Activate (server posting) requires assignees + labels
+        try:
+            has_assignees = hasattr(self, "employee_table") and self.employee_table.rowCount() > 0
+        except Exception:
+            has_assignees = False
+        self.activate_btn.setEnabled(has_assignees and has_preview_labels)
+
+        self.task_table.setEnabled(not has_assignees)
+
 
     def send_and_update(self):
-        """Generate preview and update page counter."""
-        sendFormat(self.get_table_data(), self.pdf_preview)
+        try:
+            multiplier = max(1, getattr(self, "employee_table", None).rowCount())
+        except Exception:
+            multiplier = 1
+
+        sendFormat(self.get_table_data(), self.pdf_preview, employee_multiplier=multiplier)
         self.update_page_counter()
         self.pdf_preview.setFocus()
         # Update button states after generating preview
         self.update_button_states()
+
 
     def handle_mode_change(self, old_mode, new_mode):
         """Handle sliding animations between modes."""
@@ -1830,7 +2193,6 @@ class manualTaskScreen:
 
         threading.Thread(target=run_delete).start()
 
-
     def get_table_data(self):
         data = []
         rows = self.task_table.rowCount()
@@ -1843,6 +2205,129 @@ class manualTaskScreen:
                 row_data.append(item.text() if item else "")
             data.append(row_data)
         return data
+
+
+    # --- Activate button callback target: ships tasks to server safely ---
+    def activate_assigned_tasks(self):
+        """
+        Send each employee their portion of tasks, using the actual barcodes
+        generated in the PDF preview (in order by task label).
+        Each employee gets a unique subset per task type.
+        """
+        from collections import defaultdict
+        from clientCalls import update_employee_task
+        import threading
+
+        # 1) Gather employees
+        employees = []
+        if hasattr(self, "employee_table") and self.employee_table is not None:
+            for row in range(self.employee_table.rowCount()):
+                item = self.employee_table.item(row, 0)
+                if item and item.text().strip():
+                    employees.append(item.text().strip())
+
+        if not employees:
+            print("❌ No assigned employees found in table.")
+            return
+
+        # 2) Build mapping of {task_label: [barcodes]} from pdf_preview
+        labels = getattr(self.pdf_preview, "labels", [])
+        if not labels:
+            print("❌ No labels found in PDF preview.")
+            return
+
+        task_barcodes = defaultdict(list)
+
+        # Use the same starting number as the PDF preview
+        start_num = 0
+        if hasattr(self.pdf_preview, "startCode") and str(self.pdf_preview.startCode).startswith("m"):
+            try:
+                start_num = int(self.pdf_preview.startCode[1:])
+            except ValueError:
+                start_num = 0
+
+        print(f"[DEBUG] Using barcode start number: {start_num}")
+
+        # Generate barcodes exactly as the PDF preview did
+        for global_idx, label in enumerate(labels):
+            bc_num = start_num + global_idx
+            bc = f"m{bc_num:010d}"
+            task_barcodes[label].append(bc)
+
+
+        # 3) Build list of tasks from table (label + count)
+        tasks = []
+        for row in range(1, self.task_table.rowCount()):
+            task_item = self.task_table.item(row, 0)
+            qty_item = self.task_table.item(row, 1)
+            bc_item = self.task_table.item(row, 2)
+            if not task_item:
+                continue
+            try:
+                task_name = task_item.text().strip()
+                qty = int(qty_item.text()) if qty_item else 0
+                count = int(bc_item.text()) if bc_item else 0
+            except Exception:
+                continue
+            if count <= 0:
+                continue
+            label = f"{task_name} x {qty}"
+            tasks.append((label, count))
+
+        self.show_tasks_live_popup()
+        if not tasks:
+            print("❌ No valid tasks found in table.")
+            return
+
+        # 4) Distribute barcodes for each task among employees
+        def run_post_all():
+            for emp in employees:
+                print(f"\n🚀 Sending tasks to {emp}...")
+                success = fail = 0
+                for label, count in tasks:
+                    barcodes_for_task = task_barcodes.get(label, [])
+                    if not barcodes_for_task:
+                        print(f"⚠️ No barcodes found for {label}.")
+                        continue
+
+                    # Divide barcodes evenly per employee
+                    per_emp = max(1, len(barcodes_for_task) // len(employees))
+                    start_idx = employees.index(emp) * per_emp
+                    end_idx = start_idx + per_emp
+                    if emp == employees[-1]:
+                        # last one gets leftovers
+                        end_idx = len(barcodes_for_task)
+
+                    allocated = barcodes_for_task[start_idx:end_idx]
+                    for bc in allocated:
+                        try:
+                            resp = update_employee_task(
+                                employeeName=emp,
+                                liveTask=label,
+                                status="Pending",
+                                isobarcode=bc,
+                                erase=False
+                            )
+                            if resp.get("status") == "success":
+                                success += 1
+                                print(f"✅ {emp}: {label} | Barcode: {bc}")
+                            else:
+                                fail += 1
+                                print(f"❌ {emp}: {label} | {resp.get('message')}")
+                        except Exception as e:
+                            fail += 1
+                            print(f"⚠️ Error sending {label} to {emp}: {e}")
+
+                print(f"📊 Summary for {emp}: {success} success, {fail} failed\n")
+
+            # === FINAL UI STATE CHANGES ===
+            print("🔒 Deactivating employee table and Ally button; enabling Save.")
+            self.employee_table.setEnabled(False)
+            self.ally_btn.setEnabled(False)
+            self.export_btn.setEnabled(True)
+            self.show_tasks_live_popup()
+
+        threading.Thread(target=run_post_all).start()
 
     def update_page_counter(self):
         """Update the page counter label."""
