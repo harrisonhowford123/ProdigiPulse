@@ -120,6 +120,50 @@ def fetch_tracking_history(orderNumber=None, leadBarcode=None, isoBarcode=None,
             print("[DEBUG] JSONDecodeError: Invalid JSON response from server")
         return {"status": "error", "message": "Invalid JSON response from server"}
 
+def fetch_employees_tasks(server_ip=target_ip, port=8080):
+
+    url = f"http://{server_ip}:{port}/api/employeesTasks"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("status") != "success":
+            print(f"Server error: {data.get('message')}")
+            return []
+
+        return data.get("tasks", [])
+
+    except requests.RequestException as e:
+        print(f"Error fetching employees tasks: {e}")
+        return []
+
+
+def update_employee_task(employeeName, liveTask=None, status=None, isobarcode=None, erase=False, 
+                        server_ip=target_ip, port=8080):
+
+    if not employeeName:
+        return {"status": "error", "message": "employeeName is required"}
+
+    url = f"http://{server_ip}:{port}/api/updateEmployeeTask"
+    payload = {
+        "employeeName": employeeName,
+        "liveTask": liveTask,
+        "status": status,
+        "isobarcode": isobarcode,
+        "erase": erase
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        return response.json()
+
+    except requests.RequestException as e:
+        return {"status": "error", "message": str(e)}
+    except json.JSONDecodeError:
+        return {"status": "error", "message": "Invalid JSON response from server"}
+
 def fetch_all_employees(server_ip=target_ip, port=8080) -> List[Employee]:
     url = f"http://{server_ip}:{port}/api/employees"
     try:
@@ -164,6 +208,45 @@ def add_facility_workstation(workstation_name, addElse=False, server_ip=target_i
         return {"status": "error", "message": str(e)}
     except json.JSONDecodeError:
         return {"status": "error", "message": "Invalid JSON response from server"}
+
+def edit_tasks(taskName: str, editFlag: bool, server_ip: str = target_ip, port: int = 8080, debug: bool = False) -> dict:
+
+    if not taskName:
+        return {"status": "error", "message": "taskName is required"}
+    if not isinstance(editFlag, bool):
+        return {"status": "error", "message": "editFlag must be a boolean"}
+
+    url = f"http://{server_ip}:{port}/api/editTasks"
+    payload = {"taskName": taskName, "editFlag": editFlag}
+
+    if debug:
+        print("\n[DEBUG] === edit_tasks() ===")
+        print(f"[DEBUG] URL: {url}")
+        print(f"[DEBUG] Payload: {json.dumps(payload, indent=2)}")
+
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+
+        if debug:
+            print(f"[DEBUG] Response status: {response.status_code}")
+            print(f"[DEBUG] Raw response text: {response.text[:500]}")  # prevent huge dumps
+
+        response.raise_for_status()
+        data = response.json()
+
+        if debug:
+            print(f"[DEBUG] Parsed JSON: {json.dumps(data, indent=2)}")
+
+        if data.get("status") != "success":
+            return {"status": "error", "message": data.get("message", "Unknown server error")}
+
+        return data
+
+    except requests.RequestException as e:
+        return {"status": "error", "message": str(e)}
+    except json.JSONDecodeError:
+        return {"status": "error", "message": "Invalid JSON response from server"}
+
 
 def log_employee_time(employeeName: str, logged_in: datetime, duration: str,
                       server_ip=target_ip, port=8080):
