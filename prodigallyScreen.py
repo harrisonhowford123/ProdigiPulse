@@ -164,9 +164,9 @@ class StyledSearchBar(QWidget):
         self.line_edit = QLineEdit(self)
         self.line_edit.setFont(self.font)
         self.line_edit.setPlaceholderText("Search...")
-        self.line_edit.returnPressed.connect(self._trigger_callback)
-        self.line_edit.returnPressed.disconnect()  # Remove existing connection
-        self.line_edit.returnPressed.connect(lambda: None)  # Enter does nothing
+        # When user presses Enter, trigger the tick button's callback
+        self.line_edit.returnPressed.connect(self._on_enter_pressed)
+
 
 
         self.line_edit.setStyleSheet(f"""
@@ -180,6 +180,18 @@ class StyledSearchBar(QWidget):
             }}
             QLineEdit::placeholder {{ color: rgba(255,255,255,150); }}
         """)
+
+    def _on_enter_pressed(self):
+        """Simulate pressing the tick button when Enter is pressed"""
+        parent = self.parent()
+        if hasattr(parent, "tick_btn") and parent.tick_btn:
+            # Trigger the same logic as tick button
+            parent.tick_btn.callback()
+        else:
+            # Fallback: just call search manually
+            self._trigger_callback()
+            self._refresh()
+
 
     def resizeEvent(self, event):
         self.line_edit.setGeometry(0, 0, self.width(), self.height())
@@ -491,12 +503,10 @@ class ProdigallyScreen:
         # Cross button: original _clear_text + refresh
         self.clear_btn = TickCrossButton(
             "cross",
-            lambda: self.safe_callback(
-                lambda: (self.search_widget._clear_text(), self.search_widget._refresh()),
-                "cross"
-            ),
+            lambda: self.safe_callback(self.clear_all, "cross"),
             self.window
         )
+
         self.clear_btn.setGeometry(cross_x, top_padding, btn_size, btn_size)
         self.clear_btn.show()
         self.elements.append(self.clear_btn)
@@ -508,6 +518,24 @@ class ProdigallyScreen:
 
         # Connect table click to flowchart
         self.search_results_table.currentCellChanged.connect(self.on_row_selected)
+
+    def clear_all(self):
+        """Clear search bar, table, and flowchart"""
+        global GLOBAL_SEARCH_RESULTS
+        GLOBAL_SEARCH_RESULTS = []
+
+        # Clear search input
+        if self.search_widget:
+            self.search_widget.line_edit.setText("")
+
+        # Clear table
+        if self.search_results_table:
+            self.search_results_table.setRowCount(0)
+            self.search_results_table.clearContents()
+
+        # Clear flowchart
+        if self.flowchart_widget:
+            self.flowchart_widget.scene.clear()
 
 
     def safe_callback(self, func, name):
